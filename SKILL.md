@@ -1,17 +1,18 @@
 ---
 name: opendatasus
-description: Acessa dados oficiais de saúde pública do Brasil (DataSUS/OpenDataSUS) — 101 datasets do Ministério da Saúde sobre COVID, dengue, mortalidade, vacinação, leitos, SRAG, nascimentos, indicadores, etc. Nunca fabrica dados. Requer apenas Python 3 stdlib.
+description: Acessa dados oficiais de saúde pública do Brasil (DataSUS/OpenDataSUS) — 139 datasets do Ministério da Saúde sobre COVID, dengue, mortalidade, vacinação, leitos, SRAG, nascimentos, indicadores, etc. Nunca fabrica dados. Requer apenas Python 3 stdlib.
 metadata:
   skill-author: GustavoBraga_UFV
-agent_rules:
-  - always_use_tool: true
-  - never_fabricate_data: true
-  - cite_source: true
+  version: 1.2.0
+  agent_rules:
+    - always_use_tool: true
+    - never_fabricate_data: true
+    - cite_source: true
 ---
 
 # OpenDataSUS — Dados Abertos do SUS
 
-Acesso programático a **todos os datasets oficiais do Ministério da Saúde** (101 datasets) publicados no [OpenDataSUS](https://dadosabertos.saude.gov.br). Dados armazenados em bucket público S3 da AWS, sem autenticação.
+Acesso programático a **todos os datasets oficiais do Ministério da Saúde** (139 datasets) publicados no [OpenDataSUS](https://dadosabertos.saude.gov.br). Dados armazenados em bucket público S3 da AWS, sem autenticação.
 
 
 
@@ -30,6 +31,30 @@ Use esta skill **SEMPRE** que o usuário perguntar sobre:
 3. **ALWAYS** include in your response: (a) dataset name, (b) resource URL, (c) last update date.
 4. If the tool fails or data is inaccessible, state explicitly that official data could not be accessed — do not guess.
 5. Prefer CSV resources for analytical queries (they are streamable).
+
+## Robustez e Fallback (v1.2+)
+
+O script foi reforçado para operar de forma resiliente diante de mudanças no portal:
+
+- **buildId dinâmico** — o hash de cache do Next.js (`dadosabertos.saude.gov.br`) é descoberto
+  automaticamente em tempo de execução, com fallback para um valor hardcoded. Isso evita
+  interrupções quando o portal é recompilado (causa histórica de HTTP 404).
+- **Delimitador robusto** — detecta se o CSV usa `;` (padrão BR, ex.: SIM) ou `,`
+  (ex.: SINAN/Dengue, RIPSA/MGDI) testando o `csv.Sniffer` em múltiplas amostras,
+  validando a quebra do cabeçalho e, se necessário, usando heurística de contagem —
+  superando a instabilidade do Sniffer em arquivos com `,`.
+- **Caminho `/csv/` do bucket** — se a URL do catálogo apontar para o caminho antigo do S3
+  (HTTP 403/404), tenta automaticamente a variante com `/csv/` (estrutura atual do bucket).
+- **Fallback para API oficial** — se o bucket S3 estiver inacessível, usa a API oficial
+  `apidadosabertos.saude.gov.br` (rota resolvida via swagger) com paginação.
+- **Colunas case-insensitive** — `--filter` e `--group` funcionam com nomes de colunas em
+  maiúsculas (CSV do SIM: `SEXO`, `CAUSABAS`) ou minúsculas (API): `sexo`, `causabas`.
+- **Retry simples** — chamadas de rede têm até 3 tentativas com backoff para tolerar
+  timeouts esporádicos.
+
+> Nota: nomes de colunas variam conforme a fonte. No CSV do SIM use caixa alta
+> (`SEXO`, `DTOBITO`, `CAUSABAS`); na API use minúsculas (`sexo`, `dtobito`, `causabas`).
+> O filtro/agrupamento ignora maiúsculas/minúsculas nos nomes.
 
 ## Workflow
 
@@ -80,7 +105,7 @@ python3 opendatasus.py query <dataset> --limit 1000      # Limit processing
 python3 opendatasus.py query <dataset> --json            # JSON output
 ```
 
-## Dataset catalog (101 datasets)
+## Dataset catalog (139 datasets)
 
 | Category | Datasets |
 |----------|----------|

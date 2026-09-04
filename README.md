@@ -5,24 +5,27 @@
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](https://python.org)
 [![DataSUS](https://img.shields.io/badge/data-OpenDataSUS-orange)](https://dadosabertos.saude.gov.br)
 
-> Acesse **101 datasets oficiais do Ministério da Saúde** diretamente do bucket público S3 da AWS. Sem autenticação, sem dependências externas — apenas Python 3 padrão.
+> Acesse **139 datasets oficiais do Ministério da Saúde** diretamente do bucket público S3 da AWS e, como fallback, da API oficial de Dados Abertos do SUS. Sem autenticação, sem dependências externas — apenas Python 3 padrão.
 
 Este repositório contém uma **skill para agentes de IA** (Claude Code, Cursor, OpenCode, Windsurf, GitHub Copilot, etc.) que permite consultar dados reais de saúde pública do Brasil sem fabricar ou alucinar informações.
 
 ## Funcionalidades
 
-- Listar e buscar nos 101 datasets oficiais do OpenDataSUS
+- Listar, buscar e filtrar os **139 datasets** oficiais do OpenDataSUS
 - Inspecionar metadados e recursos de qualquer dataset
-- Consultar dados CSV (incluindo arquivos ZIP) com filtros e agregações
-- Streaming de arquivos grandes (centenas de MB) sem carregar em memória
-- Suporte a ZIP, CSV, JSON
+- Consultar dados CSV (incluindo arquivos ZIP) com **filtros, agrupamentos e agregações numéricas**
+- **Streaming** de arquivos grandes (centenas de MB) sem carregar em memória
+- **Delimitador automático** (`;` ou `,`) — SIM usa `;`; SINAN/Dengue e RIPSA usam `,`
+- **Colunas case-insensitive** (CSV do SIM usa `SEXO`; API usa `sexo`)
+- **Fallback em camadas**: URL do catálogo → variante `/csv/` do bucket → **API oficial** `apidadosabertos.saude.gov.br`
+- Suporte a ZIP, CSV e JSON
 - Zero dependências — apenas Python 3 stdlib
 
 ## Quick start
 
 ```bash
-git clone https://github.com/seu-usuario/opendatasus-skill.git
-cd opendatasus-skill
+git clone https://github.com/gustavobraga-byte/Skill-DataSus.git
+cd Skill-DataSus
 
 # Sem instalação — execute diretamente
 python3 opendatasus.py list
@@ -35,17 +38,17 @@ python3 opendatasus.py query srag-2019-a-2026 --sample
 ### Listar datasets
 
 ```bash
-# Todos os datasets
+# Todos os datasets (139)
 python3 opendatasus.py list
 
 # Filtrar por categoria
-python3 opendatasus.py list --grupo "Vigilancia"
+python3 opendatasus.py list --grupo "Arboviroses"
 
 # Buscar por palavra-chave
 python3 opendatasus.py list --search "dengue"
 
 # Filtrar por formato
-python3 opendatasus.py list --formato CSV
+python3 opendatasus.py list --formato API
 
 # Saída JSON
 python3 opendatasus.py list --json
@@ -57,30 +60,64 @@ python3 opendatasus.py list --json
 python3 opendatasus.py info srag-2019-a-2026
 python3 opendatasus.py info sim
 python3 opendatasus.py info covid-19-vacinacao
+python3 opendatasus.py info arboviroses-dengue
+python3 opendatasus.py info cnes-cadastro-nacional-de-estabelecimentos-de-saude
 ```
 
-### Consultar dados
+### Consultar dados (amostra)
 
 ```bash
-# Amostra de dados
+# Amostra dos primeiros registros
 python3 opendatasus.py query srag-2019-a-2026 --sample
 
-# Filtrar por coluna
-python3 opendatasus.py query srag-2019-a-2026 --filter "CLASSI_FIN=3" --group SG_UF
+# Amostra com projeção de colunas
+python3 opendatasus.py query srag-2019-a-2026 --sample --colunas "CLASSI_FIN,SG_UF,EVOLUCAO"
+```
+
+### Filtrar e agrupar
+
+```bash
+# Filtrar por coluna e agrupar
+python3 opendatasus.py query srag-2019-a-2026 --filter "CLASSI_FIN=3" --group "SG_UF"
 
 # Múltiplos filtros
-python3 opendatasus.py query srag-2019-a-2026 --filter "CLASSI_FIN=3" --filter "EVOLUCAO=2" --group SG_UF
+python3 opendatasus.py query srag-2019-a-2026 --filter "CLASSI_FIN=3" --filter "EVOLUCAO=2" --group "SG_UF"
 
-# Agregações
-python3 opendatasus.py query arboviroses-dengue --group "NU_ANO" --filter "SG_UF=SP"
-
-# Selecionar recurso específico
-python3 opendatasus.py info sim
-python3 opendatasus.py query sim --recurso 48 --sample   # Mortalidade 2025
-
-# Colunas específicas
-python3 opendatasus.py query srag-2019-a-2026 --colunas "CLASSI_FIN,SG_UF,EVOLUCAO" --sample
+# Agregação numérica (sum/avg/min/max sobre uma coluna)
+python3 opendatasus.py query arboviroses-dengue --group "SG_UF" --group-fn avg --group-val "NU_ANO"
 ```
+
+> **Nota:** a coluna agrupada/filtrada é resolvida de forma **case-insensitive**.
+> Ex.: `--group "sexo"` encontra a coluna `SEXO`; `--group "sg_uf"` encontra `SG_UF`.
+
+### Selecionar recurso específico
+
+```bash
+# Liste os recursos (índices) de um dataset
+python3 opendatasus.py info sim
+
+# Escolha por índice (0 = primeiro, -1 = último)
+python3 opendatasus.py query sim --recurso 1 --group "sexo"
+python3 opendatasus.py query arboviroses-dengue --recurso -1 --sample
+```
+
+## Robustez e Manutenção (v1.2+)
+
+O script opera de forma resiliente frente às mudanças do portal e do bucket:
+
+- **buildId dinâmico**: o hash de cache Next.js do `dadosabertos.saude.gov.br` é descoberto
+  automaticamente em runtime (com fallback hardcoded), evitando HTTP 404 quando o portal é recompilado.
+- **Delimitador robusto**: a detecção testa o `csv.Sniffer` em múltiplas amostras, valida a
+  quebra do cabeçalho e, se necessário, usa heurística de contagem de `;`/`,` na primeira linha —
+  superando a instabilidade do Sniffer em arquivos como o SINAN/Dengue (que usa `,`).
+- **Caminho `/csv/`**: se a URL do catálogo der 403/404, tenta automaticamente a variante com
+  `/csv/` (estrutura atual do bucket S3 do MS).
+- **Fallback para a API oficial**: se o bucket estiver inacessível, consulta a API
+  `apidadosabertos.saude.gov.br` (rota resolvida via `swagger.json`) com paginação.
+- **Colunas case-insensitive**: `--filter` e `--group` ignoram maiúsculas/minúsculas.
+- **Índices de recurso negativos**: `--recurso -1` = último recurso.
+- **Retry simples**: até 3 tentativas com backoff para tolerar timeouts de rede.
+- **Erros amigáveis**: dataset inexistente mostra mensagem clara (não traceback cru).
 
 ## Como usar como skill de IA
 
@@ -95,6 +132,7 @@ Coloque `SKILL.md` em `.cursor/rules/` ou use `@Skills` para referenciar.
 ### OpenCode
 
 Adicione no `opencode.json`:
+
 ```json
 {
   "skills": ["caminho/para/SKILL.md"]
@@ -113,16 +151,15 @@ cat SKILL.md | pbcopy  # copie e cole no prompt do agente
 
 ## Datasets disponíveis
 
-| Dataset | Descrição | Tamanho aproximado |
-|---------|-----------|-------------------|
-| `srag-2019-a-2026` | SRAG (COVID, Influenza, VSR) | ~500 MB/ano |
-| `sim` | Sistema de Informação sobre Mortalidade (1979-hoje) | ~200 MB/ano |
-| `sistema-de-informacao-sobre-nascidos-vivos-sinasc` | Nascidos Vivos | ~50 MB/ano |
-| `covid-19-vacinacao` | Vacinação COVID-19 | ~1 GB (total) |
-| `arboviroses-dengue` | Dengue (2000-hoje) | ~100 MB/ano |
-| `cnes-cadastro-nacional-de-estabelecimentos-de-saude` | Estabelecimentos de saúde | ~50 MB |
-| `hospitais-e-leitos` | Leitos hospitalares | ~20 MB |
-| `bps` | Banco de Preços em Saúde | ~100 MB |
+| Dataset | Descrição | Fonte |
+|---------|-----------|-------|
+| `srag-2019-a-2026` | Síndrome Respiratória Aguda Grave (COVID, Influenza, VSR) | SRAG |
+| `sim` | Sistema de Informação sobre Mortalidade (1979–2026) | SIM |
+| `sistema-de-informacao-sobre-nascidos-vivos-sinasc` | Nascidos Vivos | SINASC |
+| `covid-19-vacinacao` | Campanha de Vacinação contra COVID-19 | PNI |
+| `arboviroses-dengue` | Dengue (2000–2026) | Sinan |
+| `cnes-cadastro-nacional-de-estabelecimentos-de-saude` | Estabelecimentos de saúde | CNES |
+| `hospitais-e-leitos` | Leitos hospitalares | CNES |
 
 Para listar todos: `python3 opendatasus.py list`
 
@@ -144,7 +181,7 @@ Para listar todos: `python3 opendatasus.py list`
                     │  OpenDataSUS     │  ← dadosabertos.saude.gov.br
                     │  (Next.js)       │
                     └────────┬─────────┘
-                             │ S3 redirect
+                             │ S3 redirect   (fallback: API)
                              ▼
                     ┌──────────────────┐
                     │  AWS S3 (público)│  ← ckan.saude.gov.br

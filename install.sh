@@ -33,7 +33,8 @@ chmod +x opendatasus.py
 # Verify imports (all stdlib)
 echo "  ✓ Verifying imports..."
 python3 -c "
-import csv, json, urllib.request, zipfile, io, argparse
+import csv, io, json, re, sys, time, urllib.request, urllib.error, zipfile, argparse
+from collections import defaultdict
 print('  ✓ All imports OK (stdlib only)')
 " 2>&1
 

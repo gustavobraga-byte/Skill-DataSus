@@ -12,40 +12,79 @@ Uso:
 Requer apenas Python 3 (stdlib). Dados oficiais — sem fabricação.
 """
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 import csv
-import gzip
 import io
 import json
-import os
 import re
 import sys
+import time
 import urllib.request
+import urllib.error
+from urllib.error import HTTPError, URLError
 import zipfile
 import argparse
 from collections import defaultdict
-from datetime import datetime, timezone
 
 OPENDATASUS_URL = "https://dadosabertos.saude.gov.br"
-NEXT_DATA_BUILD = "Bbs1i2zf-lNNrT5rwKkbo"
+# Nuvem de segurança: o buildId do Next.js muda quando o site é recompilado.
+# Função que o detecta dinamicamente e usa este valor como fallback.
+NEXT_DATA_BUILD = "Hf5EbSN9hp8IRkcbPMMPa"
 
 UA = {"User-Agent": "opencode-datasus/1.0"}
 
 
-def fetch_json(url, timeout=30):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+def fetch_json(url, timeout=45, retries=3):
+    """Faz GET e retorna JSON, com retry simples em falhas/timeouts."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+    raise last_err
+
+
+_CACHE_BUILD_ID = None
+
+
+def get_build_id(timeout=20):
+    """Obtém dinamicamente o buildId (sufixo de cache) do site Next.js.
+
+    O buildId muda quando o OpenDataSUS é recompilado; descobri-lo em
+    tempo de execução evita que o script pare de funcionar quando o
+    hash hardcoded expira (o que já ocorreu e causou HTTP 404).
+    """
+    global _CACHE_BUILD_ID
+    if _CACHE_BUILD_ID:
+        return _CACHE_BUILD_ID
+    try:
+        req = urllib.request.Request(f"{OPENDATASUS_URL}/dataset/sim", headers=UA)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            html = r.read().decode("utf-8", "ignore")
+        m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html)
+        if m:
+            _CACHE_BUILD_ID = m.group(1)
+            print(f"[opendatasus] buildId detectado: {_CACHE_BUILD_ID}", file=sys.stderr)
+            return _CACHE_BUILD_ID
+    except Exception as e:
+        print(f"[opendatasus] aviso: falha ao detectar buildId ({e}); usando fallback",
+              file=sys.stderr)
+    return NEXT_DATA_BUILD
 
 
 def listar_datasets():
     """Retorna lista de todos os datasets (paginação automática)."""
     todos = []
     for page in range(1, 8):
-        url = f"{OPENDATASUS_URL}/_next/data/{NEXT_DATA_BUILD}/dataset.json?rows=20&page={page}"
+        url = f"{OPENDATASUS_URL}/_next/data/{get_build_id()}/dataset.json?rows=20&page={page}"
         try:
-            data = fetch_json(url, timeout=15)
+            data = fetch_json(url)
             pkgs = data["pageProps"]["packages"]
             if not pkgs:
                 break
@@ -64,8 +103,8 @@ def listar_datasets():
 
 def resolver_dataset(name):
     """Obtém metadados + recursos de um dataset pelo nome."""
-    url = f"{OPENDATASUS_URL}/_next/data/{NEXT_DATA_BUILD}/dataset/{name}.json"
-    data = fetch_json(url, timeout=15)
+    url = f"{OPENDATASUS_URL}/_next/data/{get_build_id()}/dataset/{name}.json"
+    data = fetch_json(url)
     pp = data["pageProps"]
 
     metadados = {
@@ -106,13 +145,6 @@ def melhor_recurso(resources):
     return resources[-1] if resources else None
 
 
-def _raw_rows(data_bytes):
-    """Iterator over text lines from raw bytes (latin-1)."""
-    text = data_bytes.decode("latin-1")
-    for line in text.splitlines():
-        yield line
-
-
 def _open_url(url):
     """Abre URL e retorna (bytes, is_zip)."""
     req = urllib.request.Request(url, headers=UA)
@@ -127,21 +159,175 @@ def _open_url(url):
     return data
 
 
+def _detect_delimiter(text):
+    """Detecta delimitador de CSV de forma robusta (';' ou ',').
+
+    O csv.Sniffer do Python é instável: para certos arquivos (ex.: SINAN/Dengue)
+    ele falha ("Could not determine delimiter") dependendo do tamanho da amostra
+    usada. Para contornar isso, testamos o Sniffer com múltiplas amostras e,
+    se todas falharem, usamos uma heurística de contagem no primeiro bloco de
+    linhas. Por fim, validamos o resultado verificando se o cabeçalho foi quebrado
+    em >1 coluna; se não, tentamos o outro delimitador.
+    """
+    # 1) Sniffer com múltiplas amostras (pega arquivos com layout irregular)
+    linhas_naoagric = [ln for ln in text.splitlines() if ln.strip()]
+    if not linhas_naoagric:
+        return ";"
+    for amostra in (1024, 4096, 16384, len(text)):
+        fatia = text[:amostra]
+        try:
+            d = csv.Sniffer().sniff(fatia, delimiters=";,")
+            # valida: quebrou o cabeçalho em mais de uma coluna?
+            probe = next((ln for ln in linhas_naoagric if d.delimiter in ln), None)
+            if probe is not None and len(probe.split(d.delimiter)) > 1:
+                return d.delimiter
+        except csv.Error:
+            continue
+
+    # 2) Heurística de contagem na primeira linha coroada por cada delimitador
+    cab = linhas_naoagric[0]
+    n_virg = cab.count(",")
+    n_pv = cab.count(";")
+    if n_virg > n_pv:
+        return ","
+    return ";"
+
+
 def baixar_csv_stream(url):
-    """Baixa CSV (ou CSV dentro de ZIP) do S3, yield linhas como dict."""
+    """Baixa CSV (ou CSV dentro de ZIP) do S3, yield linhas como dict.
+
+    Detecta automaticamente o delimitador (';' ou ',') pois os datasets
+    do OpenDataSUS misturam ambos os formatos (ex.: SIM usa ';', SINAN/Dengue
+    e RIPSA usam ','). Também lida com BOM e aspas.
+    """
     data = _open_url(url)
-    reader = csv.reader(
-        _raw_rows(data),
-        delimiter=";",
-    )
-    header = [h.strip('"') for h in next(reader)]
+    text = data.decode("utf-8-sig", errors="replace")
+    delim = _detect_delimiter(text)
+
+    lines = text.splitlines()
+    reader = csv.reader(lines, delimiter=delim)
+    # Pula eventuais linhas em branco antes do cabeçalho
+    header = None
     for row in reader:
+        if not any(c.strip() for c in row):
+            continue
+        header = [h.strip('"') for h in row]
+        break
+    if header is None:
+        return
+    for row in reader:
+        if not any(c.strip() for c in row):
+            continue
         yield dict(zip(header, (c.strip('"') for c in row)))
 
 
 def baixar_json(url):
     """Baixa JSON."""
     return fetch_json(url, timeout=300)
+
+
+# Base da API de Dados Abertos do SUS (fonte oficial alternativa ao bucket S3)
+APIDADOSABERTOS_BASE = "https://apidadosabertos.saude.gov.br"
+
+_SWAGGER_PATHS = None
+
+
+def _swagger_paths(timeout=30):
+    """Retorna lista de paths reais da API (ex.: '/vigilancia-e-meio-ambiente/...').
+
+    Baixa o spec OpenAPI uma vez e o cacheia em memória.
+    """
+    global _SWAGGER_PATHS
+    if _SWAGGER_PATHS is not None:
+        return _SWAGGER_PATHS
+    try:
+        req = urllib.request.Request(f"{APIDADOSABERTOS_BASE}/static/swagger.json", headers=UA)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            spec = json.loads(r.read())
+        _SWAGGER_PATHS = list(spec.get("paths", {}).keys())
+    except Exception:
+        _SWAGGER_PATHS = []
+    return _SWAGGER_PATHS
+
+
+def api_rota_do_recurso(resource, timeout=30):
+    """Extrai a rota real da API a partir da URL do recurso (fragmento Swagger).
+
+    O link tem formato '#/Tag/get_rota_com_underlines'. Como o path real usa
+    hífens e '/' (ex.: '/vigilancia-e-meio-ambiente/sistema-de-informacao-sobre-
+    mortalidade'), normalizamos os paths reais e buscamos match com o fragmento.
+    """
+    url = resource.get("url", "")
+    if APIDADOSABERTOS_BASE not in url:
+        return None
+    # Fragmento após o último '#/' -> ex.: 'get_vigilancia_...'
+    frag = url.split("#/")[-1].strip()
+    m = re.search(r"(get|post|put|delete)_(.*)$", frag)
+    if not m:
+        return None
+    operacao, resto = m.group(1), m.group(2)
+    # Chave normalizada esperada do fragmento
+    alvo = f"{operacao}_{resto}".replace("-", "_").lower()
+    paths = _swagger_paths(timeout=timeout)
+    # 1) match exato por normalização (robusto)
+    for p in paths:
+        norm = ("get_" + p.strip("/")).replace("/", "_").replace("-", "_").lower()
+        if norm == alvo:
+            return p
+    # 2) fallback: substring do resto com hífens
+    alvo_hi = resto.replace("_", "-").lower()
+    for p in paths:
+        if alvo_hi in p.lower():
+            return p
+    # 3) último fallback: converte underscores em hífens e prefixa '/'
+    return "/" + resto.replace("_", "-")
+
+
+def encontra_recurso_api(resources):
+    """Retorna o recurso de API (formato 'API' com URL apidadosabertos), se houver."""
+    for r in resources:
+        if r.get("format") == "api" and APIDADOSABERTOS_BASE in r.get("url", ""):
+            return r
+    return None
+
+
+def api_fetch_rows(rota, limit=1000, offset=0):
+    """Busca registros da API oficial. Retorna (lista de dicts, total_estimado ou None).
+
+    Tenta CVS (Accept: text/csv) primeiro (mais leve), com fallback para JSON.
+    """
+    url = f"{APIDADOSABERTOS_BASE}{rota}?limit={limit}&offset={offset}"
+    # --- tenta CSV ---
+    try:
+        req = urllib.request.Request(url, headers={**UA, "Accept": "text/csv"})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            raw = r.read()
+        text = raw.decode("utf-8-sig", errors="replace")
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            reader = csv.reader(lines, delimiter=";")
+            header = [h.strip('"').strip() for h in next(reader)]
+            rows = []
+            for row in reader:
+                rows.append(dict(zip(header, (c.strip('"') for c in row))))
+            return rows, len(rows)
+    except urllib.error.HTTPError:
+        # sem suporte CSV -> tenta JSON
+        pass
+    except Exception:
+        pass
+    # --- fallback JSON ---
+    req = urllib.request.Request(url, headers={**UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        payload = json.loads(r.read())
+    # O payload é um dict cuja chave é o nome da entidade (ex.: 'sim' -> lista)
+    rows = payload
+    if isinstance(payload, dict):
+        for v in payload.values():
+            if isinstance(v, list):
+                rows = v
+                break
+    return rows, len(rows) if isinstance(rows, list) else None
 
 
 def parse_filter_value(val):
@@ -154,14 +340,140 @@ def parse_filter_value(val):
     return val
 
 
+def _get_col(row, name):
+    """Busca valor de coluna de forma case-insensitive.
+
+    Os CSVs do OpenDataSUS usam nomes de colunas inconsistentes entre fontes
+    (ex.: SIM usa 'SEXO' em caixa alta no CSV, mas 'sexo' na API).
+    """
+    if name in row:
+        return row[name]
+    lname = name.lower()
+    for k, v in row.items():
+        if k.lower() == lname:
+            return v
+    return row.get(name, "")
+
+
 def match_filter(row, filtros):
-    """Verifica se linha satisfaz todos os filtros."""
+    """Verifica se linha satisfaz todos os filtros (case-insensitive por coluna)."""
     for col, val in filtros:
-        actual = row.get(col, "").strip()
+        actual = _get_col(row, col).strip()
         val = val.strip()
         if actual != val:
             return False
     return True
+
+
+def _url_variante_csv(url):
+    """Retorna variante do URL com '/csv/' inserido antes do nome do arquivo
+    (padrão atual do bucket do MS). Ex.:
+      .../SIM/Mortalidade_Geral_2026_csv.zip
+      -> .../SIM/csv/Mortalidade_Geral_2026_csv.zip
+    Retorna a própria URL se não houver o que mudar.
+    """
+    if "/csv/" in url.split("?")[0]:
+        return url
+    base = url.split("/")
+    nome = base[-1]
+    pasta = "/".join(base[:-1])
+    return f"{pasta}/csv/{nome}"
+
+
+def iter_csv_com_fallback(url, resources, max_records=200000):
+    """Itera linhas de um CSV do S3 com robusters em camadas:
+    1) tenta a URL original;
+    2) se falhar (403/404), tenta a variante com '/csv' (mudança estrutural do bucket);
+    3) se ainda falhar, usa a API oficial de Dados Abertos como fallback.
+    'max_records' limita o volume consultado via API.
+    """
+    tentativas = [url]
+    variante = _url_variante_csv(url)
+    if variante != url:
+        tentativas.append(variante)
+
+    ultimo_erro = None
+    for u in tentativas:
+        try:
+            for row in baixar_csv_stream(u):
+                yield row
+            return
+        except (HTTPError, URLError, OSError, ValueError) as e:
+            ultimo_erro = e
+            continue
+
+    api_rec = encontra_recurso_api(resources)
+    if api_rec is None:
+        raise ultimo_erro
+    rota = api_rota_do_recurso(api_rec)
+    if not rota:
+        raise ultimo_erro
+    print(f"[fallback] S3 indisponível ({type(ultimo_erro).__name__}); "
+          f"usando API oficial {rota}", file=sys.stderr)
+    offset = 0
+    while offset < max_records:
+        rows, n = api_fetch_rows(rota, limit=1000, offset=offset)
+        if not rows:
+            break
+        for row in rows:
+            yield row
+        if n < 1000:
+            break
+        offset += 1000
+
+
+def iter_registros(recurso, resources):
+    """Fonte unificada de linhas a partir de um recurso (CSV do S3 com fallback API)."""
+    fmt = recurso["format"]
+    if fmt == "api":
+        rota = api_rota_do_recurso(recurso)
+        if not rota:
+            raise ValueError(f"Não foi possível extrair rota da API: {recurso['url']}")
+        offset = 0
+        while True:
+            rows, n = api_fetch_rows(rota, limit=1000, offset=offset)
+            if not rows:
+                break
+            for row in rows:
+                yield row
+            if n < 1000:
+                break
+            offset += 1000
+    elif fmt == "csv":
+        yield from iter_csv_com_fallback(recurso["url"], resources)
+    elif fmt == "json":
+        data = baixar_json(recurso["url"])
+        if isinstance(data, list):
+            for row in data:
+                yield row if isinstance(row, dict) else {recurso["name"]: row}
+        elif isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    for row in v:
+                        yield row if isinstance(row, dict) else {recurso["name"]: row}
+                    break
+    else:
+        raise ValueError(f"Formato '{fmt}' não suportado para consulta via API/CSV")
+
+
+def _resolver_dataset_amigavel(name):
+    """Resolve um dataset convertendo erros de acesso (404/500 do portal,
+    rede) numa mensagem clara de 'não encontrado' em vez de um traceback cru."""
+    try:
+        return resolver_dataset(name)
+    except HTTPError as e:
+        if e.code in (404, 500):
+            print(f"ERRO: Dataset '{name}' não encontrado no OpenDataSUS "
+                  f"(HTTP {e.code}). Verifique o nome com 'list'.",
+                  file=sys.stderr)
+        else:
+            print(f"ERRO de acesso ao portal OpenDataSUS (HTTP {e.code}): {e}",
+                  file=sys.stderr)
+        sys.exit(1)
+    except URLError as e:
+        print(f"ERRO de rede ao consultar o OpenDataSUS: {e.reason}",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
@@ -266,7 +578,7 @@ def main():
 
     # ---- info ----
     elif args.cmd == "info":
-        metadados, resources = resolver_dataset(args.name)
+        metadados, resources = _resolver_dataset_amigavel(args.name)
         print(f"{'='*70}")
         print(f"DATASET: {metadados['name']}")
         print(f"{'='*70}")
@@ -284,16 +596,18 @@ def main():
 
     # ---- query ----
     elif args.cmd == "query":
-        metadados, resources = resolver_dataset(args.name)
+        metadados, resources = _resolver_dataset_amigavel(args.name)
         if not resources:
             print(f"ERRO: Nenhum recurso encontrado para '{args.name}'", file=sys.stderr)
             sys.exit(1)
 
         if args.recurso is not None:
-            if args.recurso < 0 or args.recurso >= len(resources):
-                print(f"ERRO: Índice de recurso inválido. Use 0-{len(resources)-1}", file=sys.stderr)
+            idx = args.recurso if args.recurso >= 0 else len(resources) + args.recurso
+            if idx < 0 or idx >= len(resources):
+                print(f"ERRO: Índice de recurso inválido. Use 0-{len(resources)-1} "
+                      f"(ou negativo, ex: -1=último)", file=sys.stderr)
                 sys.exit(1)
-            recurso = resources[args.recurso]
+            recurso = resources[idx]
         else:
             recurso = melhor_recurso(resources)
             if not recurso:
@@ -323,7 +637,7 @@ def main():
         print(f"Atualizado: {metadados.get('metadata_modified', 'desconhecida')}", file=sys.stderr)
         print(file=sys.stderr)
 
-        if fmt == "csv":
+        if fmt in ("csv", "api", "json"):
             colunas_exibir = None
             if args.colunas:
                 colunas_exibir = [c.strip() for c in args.colunas.split(",")]
@@ -334,39 +648,49 @@ def main():
             total_lines = 0
             filtrados = 0
 
-            for row in baixar_csv_stream(url):
-                total_lines += 1
-                if total_lines % 500000 == 0:
-                    print(f"  Processados: {total_lines:,} registros...", file=sys.stderr)
+            try:
+                for row in iter_registros(recurso, resources):
+                    total_lines += 1
+                    if total_lines % 500000 == 0:
+                        print(f"  Processados: {total_lines:,} registros...", file=sys.stderr)
 
-                if not match_filter(row, filtros):
-                    continue
+                    if not match_filter(row, filtros):
+                        continue
 
-                filtrados += 1
+                    filtrados += 1
 
-                if args.group:
-                    chave = row.get(args.group, "")
-                    grp_vals[chave] += 1
-                    grp_counts[chave] += 1
-                    if args.group_val and args.group_fn in ("sum", "avg", "min", "max"):
-                        try:
-                            v = float(row.get(args.group_val, "0") or "0")
-                            grp_sums[chave] += v
-                            if args.group_fn == "min":
-                                if chave not in grp_sums:
-                                    grp_sums[chave] = v
-                                else:
-                                    grp_sums[chave] = min(grp_sums[chave], v)
-                            if args.group_fn == "max":
-                                if chave not in grp_sums:
-                                    grp_sums[chave] = v
-                                else:
-                                    grp_sums[chave] = max(grp_sums[chave], v)
-                        except (ValueError, TypeError):
-                            pass
+                    if args.group:
+                        chave = _get_col(row, args.group)
+                        grp_vals[chave] += 1
+                        grp_counts[chave] += 1
+                        if args.group_val and args.group_fn in ("sum", "avg", "min", "max"):
+                            try:
+                                v = float(_get_col(row, args.group_val) or "0")
+                                grp_sums[chave] += v
+                                if args.group_fn == "min":
+                                    if chave not in grp_sums:
+                                        grp_sums[chave] = v
+                                    else:
+                                        grp_sums[chave] = min(grp_sums[chave], v)
+                                if args.group_fn == "max":
+                                    if chave not in grp_sums:
+                                        grp_sums[chave] = v
+                                    else:
+                                        grp_sums[chave] = max(grp_sums[chave], v)
+                            except (ValueError, TypeError):
+                                pass
 
-                if args.limit and filtrados >= args.limit:
-                    break
+                    if args.limit and filtrados >= args.limit:
+                        break
+            except HTTPError as e:
+                print(f"\nERRO de acesso à fonte de dados: {e}", file=sys.stderr)
+                print("Não foi possível obter os dados nesta fonte. "
+                      "Verifique se o bucket/API está acessível ou tente outro recurso.",
+                      file=sys.stderr)
+                sys.exit(1)
+            except URLError as e:
+                print(f"\nERRO de rede ao acessar a fonte: {e.reason}", file=sys.stderr)
+                sys.exit(1)
 
             print()
             print(f"{'='*60}")
@@ -409,7 +733,7 @@ def main():
                 print()
                 print(f"Amostra (primeiros {filtrados} registros):")
                 grp_vals = defaultdict(int)
-                for row in baixar_csv_stream(url):
+                for row in iter_registros(recurso, resources):
                     if not match_filter(row, filtros):
                         continue
                     if colunas_exibir:
@@ -425,18 +749,10 @@ def main():
                     if grp_vals["_sample"] >= 5:
                         break
 
-        elif fmt == "json":
-            data = baixar_json(url)
-            if isinstance(data, list):
-                if args.limit:
-                    data = data[:args.limit]
-                print(json.dumps(data, indent=2, ensure_ascii=False)[:5000])
-            else:
-                print(json.dumps(data, indent=2, ensure_ascii=False)[:2000])
         else:
-            print(f"Formato '{fmt}' não suportado para consulta direta.")
+            print(f"Formato '{fmt}' não suportado para consulta via CSV/API/JSON.")
             print(f"URL do recurso: {url}")
-            print(f"Baixe manualmente ou use outro formato (CSV preferencial).")
+            print(f"Baixe manualmente ou use outro formato (CSV/API preferencial).")
 
 
 if __name__ == "__main__":
